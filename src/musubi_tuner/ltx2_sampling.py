@@ -48,6 +48,15 @@ def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str
     return "none"
 
 
+def _build_sampling_scheduler(args: argparse.Namespace):
+    """Pick the validation/inference scheduler based on --sample_scheduler. Defaults to LTX2Scheduler."""
+    from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler, LinearQuadraticScheduler
+    name = str(getattr(args, "sample_scheduler", "ltx2") or "ltx2").lower()
+    if name in ("linear_quadratic", "linear-quadratic", "lq"):
+        return LinearQuadraticScheduler()
+    return LTX2Scheduler()
+
+
 class LTX2SamplingMixin:
 
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
@@ -2026,8 +2035,8 @@ class LTX2SamplingMixin:
                     clean_latent = None
                     i2v_conditioning_mask_tokens = None
 
-        # Setup scheduler - official pipeline does NOT pass latent, uses default MAX_SHIFT_ANCHOR=4096
-        ltx2_scheduler = LTX2Scheduler()
+        # Setup scheduler - default LTX2Scheduler; switch to LinearQuadratic for distilled models via --sample_scheduler
+        ltx2_scheduler = _build_sampling_scheduler(args)
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
 
         audio_latents = None
@@ -2647,7 +2656,7 @@ class LTX2SamplingMixin:
             self._ensure_nf4_buffers_on_device(base_model)
 
         # Scheduler
-        ltx2_scheduler = LTX2Scheduler()
+        ltx2_scheduler = _build_sampling_scheduler(args)
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
 
         # V2V denoising loop
@@ -2663,6 +2672,37 @@ class LTX2SamplingMixin:
                 # Concatenate ref + target
                 combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
 
+                # Role embedding (mirror training-time application)
+                role_embed = getattr(self._network_obj, "role_embedding", None) if hasattr(self, "_network_obj") else None
+                if step_idx == 0:
+                    has_attr = hasattr(self, "_network_obj")
+                    has_role = role_embed is not None
+                    logger.info(f"V2V sampling: _network_obj attr={has_attr}, role_embedding={'present' if has_role else 'absent'}")
+                    if has_role:
+                        with torch.no_grad():
+                            w = role_embed.weight.detach().float()
+                            logger.info(f"V2V sampling: role norms target={w[0].norm():.3g} appearance={w[1].norm():.3g} motion={w[2].norm():.3g}")
+                role_emb_post_proj_vals = None  # set below when post_proj
+                if role_embed is not None:
+                    appearance_latents = max(0, int(getattr(args, "role_appearance_latents", 1)))
+                    tokens_per_ref_frame = ref_height * ref_width
+                    appearance_seq_len = min(ref_seq_len, appearance_latents * tokens_per_ref_frame)
+                    role_indices = torch.zeros(
+                        (bsz, ref_seq_len + target_seq_len),
+                        dtype=torch.long,
+                        device=combined_tokens.device,
+                    )
+                    if appearance_seq_len > 0:
+                        role_indices[:, :appearance_seq_len] = 1
+                    if appearance_seq_len < ref_seq_len:
+                        role_indices[:, appearance_seq_len:ref_seq_len] = 2
+                    role_emb_vals = role_embed(role_indices)
+                    location = getattr(self._network_obj, "_role_embedding_location", "pre_proj")
+                    if location == "post_proj":
+                        role_emb_post_proj_vals = role_emb_vals
+                    else:
+                        combined_tokens = combined_tokens + role_emb_vals.to(combined_tokens.dtype)
+
                 # Target conditioning mask (all False = all denoised)
                 target_conditioning_mask = torch.zeros(
                     (bsz, target_seq_len), device=transformer_device, dtype=torch.bool
@@ -2676,6 +2716,22 @@ class LTX2SamplingMixin:
                 )
 
                 perturbations = BatchedPerturbationConfig.empty(bsz)
+
+                # Install patchify_proj forward hook for post_proj role embedding (no-op otherwise).
+                _role_hook_handle = None
+                if role_emb_post_proj_vals is not None:
+                    _proj_module = getattr(base_model, "patchify_proj", None) or getattr(
+                        getattr(base_model, "model", None), "patchify_proj", None
+                    )
+                    if _proj_module is not None:
+                        _emb = role_emb_post_proj_vals
+                        def _role_emb_post_proj_hook(_mod, _inp, output, _emb=_emb):
+                            re = _emb.to(dtype=output.dtype, device=output.device)
+                            if output.shape[0] != re.shape[0]:
+                                repeat = output.shape[0] // re.shape[0]
+                                re = re.repeat(repeat, 1, 1)
+                            return output + re
+                        _role_hook_handle = _proj_module.register_forward_hook(_role_emb_post_proj_hook)
 
                 if do_classifier_free_guidance:
                     # Duplicate everything for CFG (unconditional + conditional)
@@ -2693,7 +2749,11 @@ class LTX2SamplingMixin:
                         sigma=sigma,
                         context_mask=prompt_mask,
                     )
-                    pred_tokens, _ = base_model(video_modality, None, cfg_perturbations)
+                    try:
+                        pred_tokens, _ = base_model(video_modality, None, cfg_perturbations)
+                    finally:
+                        if _role_hook_handle is not None:
+                            _role_hook_handle.remove()
 
                     # Split and extract target predictions only
                     pred_tokens = pred_tokens[:, ref_seq_len:, :]
@@ -2730,7 +2790,11 @@ class LTX2SamplingMixin:
                         sigma=sigma,
                         context_mask=prompt_mask,
                     )
-                    pred_tokens, _ = base_model(video_modality, None, perturbations)
+                    try:
+                        pred_tokens, _ = base_model(video_modality, None, perturbations)
+                    finally:
+                        if _role_hook_handle is not None:
+                            _role_hook_handle.remove()
 
                     # Extract target predictions only
                     target_pred = pred_tokens[:, ref_seq_len:, :]
@@ -2942,7 +3006,7 @@ class LTX2SamplingMixin:
             self._ensure_nf4_buffers_on_device(base_model)
 
         # Scheduler
-        ltx2_scheduler = LTX2Scheduler()
+        ltx2_scheduler = _build_sampling_scheduler(args)
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
 
         logger.info(

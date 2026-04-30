@@ -2523,7 +2523,9 @@ class NetworkTrainer:
             return
         _log_vram("AFTER LoRA network creation", logger)
 
-        if hasattr(network_module, "prepare_network"):
+        # Check the network instance (not the module): LoRANetwork.prepare_network
+        # is an instance method, and the module doesn't expose it at the top level.
+        if hasattr(network, "prepare_network") and callable(getattr(network, "prepare_network")):
             network.prepare_network(args)
 
         # apply network to DiT
@@ -4090,6 +4092,25 @@ class NetworkTrainer:
                         logs.update(pres_losses)
                     if audio_diagnostics:
                         logs.update(audio_diagnostics)
+                    # Role embedding diagnostics: per-role L2 norm + max-pair distance.
+                    # If norms stay near 0 across steps, gradients are not flowing to
+                    # the role embedding (the optimizer isn't training it).
+                    role_emb_module = getattr(network, "role_embedding", None) if network is not None else None
+                    if role_emb_module is not None and hasattr(role_emb_module, "weight"):
+                        with torch.no_grad():
+                            w = role_emb_module.weight.detach().float()
+                            if w.dim() == 2 and w.shape[0] >= 1:
+                                role_names = ["target", "appearance", "motion"]
+                                for i in range(w.shape[0]):
+                                    name = role_names[i] if i < len(role_names) else f"r{i}"
+                                    logs[f"role_embedding/norm_{name}"] = float(w[i].norm().item())
+                                if w.shape[0] >= 2:
+                                    pair_dists = []
+                                    for i in range(w.shape[0]):
+                                        for j in range(i + 1, w.shape[0]):
+                                            pair_dists.append(float((w[i] - w[j]).norm().item()))
+                                    if pair_dists:
+                                        logs["role_embedding/max_pair_distance"] = max(pair_dists)
                     accelerator.log(logs, step=global_step)
 
                     # Log automagic LR histogram directly to tracker

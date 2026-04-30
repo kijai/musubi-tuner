@@ -192,7 +192,18 @@ def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False):
     converted = 0
     failed = 0
 
+    # Auxiliary (non-LoRA) trainable modules to pass through unchanged
+    AUX_KEY_PREFIXES = ("role_embedding.",)
+
     for key, tensor in trained_state_dict.items():
+        # Pass auxiliary trainable modules (e.g., role_embedding) through unchanged
+        if any(key.startswith(prefix) for prefix in AUX_KEY_PREFIXES):
+            comfy_state_dict[key] = tensor
+            converted += 1
+            if verbose:
+                print(f"Passthrough auxiliary key: {key}")
+            continue
+
         new_key = convert_key_to_comfy(key)
 
         if new_key is None:

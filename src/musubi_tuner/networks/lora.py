@@ -710,9 +710,45 @@ class LoRANetwork(torch.nn.Module):
 
     def prepare_network(self, args):
         """
-        called after the network is created
+        called after the network is created (before optimizer prep).
+        Attaches auxiliary trainable modules (e.g., role_embedding) so they're
+        included in the optimizer's parameter list.
         """
-        pass
+        # Attach role embedding as a child module if requested. Done here (not later)
+        # so its parameters are picked up by prepare_optimizer_params.
+        if getattr(args, "role_embedding", False) and not hasattr(self, "role_embedding"):
+            from torch import nn as _nn
+            num_roles = 3  # target / appearance-ref / motion-ref
+            location = str(getattr(args, "role_embedding_location", "pre_proj")).lower()
+            # pre_proj: add to 128-dim patch latent (legacy, latent-space). post_proj: 4096-dim,
+            # added via forward hook on patchify_proj output (transformer hidden space).
+            if location == "post_proj":
+                role_embed_dim = 4096  # LTX-2/2.3 transformer hidden dim
+            else:
+                role_embed_dim = 128  # LTX-2 patchified video token dim
+            init_std = float(getattr(args, "role_embedding_init_std", 0.0))
+            role_embed = _nn.Embedding(num_roles, role_embed_dim)
+            if init_std > 0.0:
+                _nn.init.normal_(role_embed.weight, mean=0.0, std=init_std)
+            else:
+                _nn.init.zeros_(role_embed.weight)
+            try:
+                ref_param = next(self.parameters())
+                role_embed = role_embed.to(device=ref_param.device, dtype=ref_param.dtype)
+            except StopIteration:
+                pass
+            self.role_embedding = role_embed
+            # Stash location + LR multiplier so the trainer/sampler/optimizer can read them.
+            self._role_embedding_location = location
+            self._role_embedding_lr_mult = float(getattr(args, "role_embedding_lr_mult", 1.0))
+            init_kind = f"normal(std={init_std})" if init_std > 0.0 else "zero"
+            logger.info(
+                "Role embedding attached (in prepare_network): %d roles, dim=%d, location=%s, "
+                "appearance_latents=%d, init=%s, lr_mult=%.1f",
+                num_roles, role_embed_dim, location,
+                int(getattr(args, "role_appearance_latents", 1)),
+                init_kind, self._role_embedding_lr_mult,
+            )
 
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
@@ -861,6 +897,20 @@ class LoRANetwork(torch.nn.Module):
                 suffix = " plus" if key == "plus" else ""
                 lr_descriptions.append(f"unet_{desc}{suffix}")
 
+        # Include auxiliary trainable modules (e.g., role_embedding) at default unet_lr.
+        for aux_name in ("role_embedding",):
+            aux_module = getattr(self, aux_name, None)
+            if aux_module is None:
+                continue
+            aux_params = [p for p in aux_module.parameters() if p.requires_grad]
+            if aux_params:
+                all_params.append({
+                    "params": aux_params,
+                    "lr": unet_lr,
+                    "group_name": aux_name,
+                })
+                lr_descriptions.append(aux_name)
+
         # Log group breakdown
         logger.info(f"LR groups: {len(all_params)} groups created")
         for param_data, desc in zip(all_params, lr_descriptions):
@@ -913,6 +963,23 @@ class LoRANetwork(torch.nn.Module):
             params, descriptions = assemble_params(self.unet_loras, unet_lr, self.loraplus_lr_ratio)
             all_params.extend(params)
             lr_descriptions.extend(["unet" + (" " + d if d else "") for d in descriptions])
+
+        # Include auxiliary trainable modules attached to the network (e.g., role_embedding).
+        # These are not LoRA modules but learnable params we want trained alongside the LoRA.
+        for aux_name in ("role_embedding",):
+            aux_module = getattr(self, aux_name, None)
+            if aux_module is None:
+                continue
+            aux_params = [p for p in aux_module.parameters() if p.requires_grad]
+            if aux_params:
+                lr_mult = float(getattr(self, f"_{aux_name}_lr_mult", 1.0))
+                aux_lr = unet_lr * lr_mult if unet_lr is not None else None
+                all_params.append({
+                    "params": aux_params,
+                    "lr": aux_lr,
+                    "group_name": aux_name,
+                })
+                lr_descriptions.append(f"{aux_name}(x{lr_mult:g})")
 
         return all_params, lr_descriptions
 

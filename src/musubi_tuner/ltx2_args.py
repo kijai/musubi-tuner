@@ -477,6 +477,54 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
     )
     parser.add_argument(
+        "--reference_dropout_p",
+        type=float,
+        default=0.0,
+        help="Probability of replacing reference latents with random noise per training step (v2v IC-LoRA only). "
+        "Breaks pixel-copy shortcuts and trains the model to handle missing/weak reference at inference. 0.0 disables.",
+    )
+    parser.add_argument(
+        "--role_embedding",
+        action="store_true",
+        help="Add a learnable role embedding (3 roles: target / appearance-ref / motion-ref) to combined_tokens "
+        "before transformer forward (v2v IC-LoRA only). Trained jointly with LoRA. "
+        "Saved/loaded as part of the LoRA artifact. Aims to strengthen role-aware attention.",
+    )
+    parser.add_argument(
+        "--role_appearance_latents",
+        type=int,
+        default=1,
+        help="Number of leading reference latent frames tagged as 'appearance' role (rest of ref = 'motion'). "
+        "Default 1 = first latent of ref branch is appearance, latents 1+ are motion. "
+        "Only applies when --role_embedding is set.",
+    )
+    parser.add_argument(
+        "--role_embedding_lr_mult",
+        type=float,
+        default=1.0,
+        help="Multiplier on the base learning rate for the role embedding parameters. "
+        "Default 1.0 = same LR as LoRA. Try 10-100 to make role embedding learn faster (its norms "
+        "grow slowly with default LR because it's zero-initialized and only 384 params).",
+    )
+    parser.add_argument(
+        "--role_embedding_init_std",
+        type=float,
+        default=0.0,
+        help="Standard deviation for Gaussian initialization of role embedding (default 0.0 = zero-init). "
+        "Try 0.01-0.05 to give role embedding a non-zero starting signal so the LoRA learns to use it "
+        "from the start rather than the embedding having to catch up.",
+    )
+    parser.add_argument(
+        "--role_embedding_location",
+        type=str,
+        default="pre_proj",
+        choices=["pre_proj", "post_proj"],
+        help="Where to inject the role embedding. 'pre_proj' (default, legacy): added to 128-dim patch latents "
+        "before patchify_proj — risk of latching onto luminance axes in patch space. "
+        "'post_proj': 4096-dim embedding added via forward hook on patchify_proj output, in the transformer "
+        "hidden space, more directly addressable by attention and avoids the luminance-axis shortcut.",
+    )
+    parser.add_argument(
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
@@ -637,6 +685,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_include_reference",
         action="store_true",
         help="Show V2V reference side-by-side with generated output in sample videos.",
+    )
+    parser.add_argument(
+        "--sample_scheduler",
+        type=str,
+        default="ltx2",
+        choices=["ltx2", "linear_quadratic"],
+        help="Scheduler for validation/sample generation. 'ltx2' (default) for non-distilled checkpoints; "
+             "'linear_quadratic' for distilled checkpoints (use with low step counts e.g. --s 8 and cfg=1.0).",
     )
     parser.add_argument(
         "--reference_downscale",
@@ -1053,9 +1109,13 @@ def main() -> None:
         logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
     args.dit = args.ltx2_checkpoint
 
-    if getattr(args, "vae", None) is not None and args.vae != args.ltx2_checkpoint:
-        logger.warning("Ignoring --vae for LTX-2; using --ltx2_checkpoint instead")
-    args.vae = args.ltx2_checkpoint
+    # Allow --vae to override the LTX-2 checkpoint as the VAE source.
+    # Useful when --ltx2_checkpoint points to a transformer-only file (e.g. mxfp8 distill)
+    # that lacks VAE weights — supply a standalone VAE safetensors via --vae.
+    if getattr(args, "vae", None) is None or args.vae == args.ltx2_checkpoint:
+        args.vae = args.ltx2_checkpoint
+    else:
+        logger.info(f"Using standalone --vae path: {args.vae} (separate from --ltx2_checkpoint)")
 
     if getattr(args, "weighting_scheme", None) not in {None, "none"}:
         logger.warning("Ignoring --weighting_scheme for LTX-2; forcing weighting_scheme=none")

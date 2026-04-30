@@ -720,6 +720,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if network is None:
             return
 
+        # Stash network reference for later access (e.g., role embedding lookup in call_dit)
+        self._network_obj = network
+
         # Apply special initialization if configured
         if hasattr(args, "_network_init_params"):
             init_params = args._network_init_params
@@ -733,6 +736,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     init_lokr_network_with_perturbed_normal(network, scale=scale)
                 except Exception as e:
                     logger.warning(f"Failed to apply LoKR initialization: {e}")
+
+        # NB: role_embedding is attached in LoRANetwork.prepare_network so its
+        # parameters are picked up by prepare_optimizer_params (which runs before
+        # this hook). See lora.py prepare_network.
 
     def compute_prior_divergence_addition(
         self,
@@ -2672,6 +2679,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             patchifier = VideoLatentPatchifier(patch_size=1)
 
             ref_latents = ref_latents.to(device=accelerator.device, dtype=network_dtype)
+
+            ref_dropout_p = float(getattr(args, "reference_dropout_p", 0.0))
+            if ref_dropout_p > 0.0 and bool(torch.rand((), device=accelerator.device) < ref_dropout_p):
+                ref_latents = torch.randn_like(ref_latents)
+
             ref_tokens = patchifier.patchify(ref_latents)
             target_tokens = patchifier.patchify(model_noisy_video)
             combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
@@ -2684,6 +2696,38 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             ref_width = int(ref_latents.shape[4])
             tgt_height = int(latents.shape[3])
             tgt_width = int(latents.shape[4])
+
+            # Role embedding: tag tokens by role (0=target, 1=appearance-ref, 2=motion-ref).
+            # Two locations supported (see --role_embedding_location):
+            #   pre_proj  → add to 128-dim combined_tokens before transformer's patchify_proj.
+            #   post_proj → install forward hook on patchify_proj so the 4096-dim embedding is
+            #               added to the projected hidden states (avoids latent-space luminance shortcut).
+            role_embed = getattr(self._network_obj, "role_embedding", None) if hasattr(self, "_network_obj") else None
+            role_emb_post_proj_vals = None  # set below when post_proj
+            if role_embed is not None:
+                appearance_latents = max(0, int(getattr(args, "role_appearance_latents", 1)))
+                tokens_per_ref_frame = ref_height * ref_width
+                appearance_seq_len = min(ref_seq_len, appearance_latents * tokens_per_ref_frame)
+                role_indices = torch.zeros((bsz, ref_seq_len + target_seq_len), dtype=torch.long, device=accelerator.device)
+                if appearance_seq_len > 0:
+                    role_indices[:, :appearance_seq_len] = 1  # V2V appearance role
+                if appearance_seq_len < ref_seq_len:
+                    role_indices[:, appearance_seq_len:ref_seq_len] = 2  # motion role
+                # Also tag the I2V conditioning frame (target's first latent) as appearance role.
+                # Both the V2V appearance buffer and the I2V image are clean RGB stills of the
+                # subject and serve the same identity-reference function. Pooling them under
+                # role 1 strengthens the appearance signal during training.
+                if video_conditioning_enabled is not None:
+                    first_frame_tokens = tgt_height * tgt_width
+                    if first_frame_tokens > 0:
+                        role_indices[video_conditioning_enabled, ref_seq_len : ref_seq_len + first_frame_tokens] = 1
+                # role 0 (target) is the default for the rest of target tokens
+                role_emb_vals = role_embed(role_indices)
+                location = getattr(self._network_obj, "_role_embedding_location", "pre_proj")
+                if location == "post_proj":
+                    role_emb_post_proj_vals = role_emb_vals
+                else:
+                    combined_tokens = combined_tokens + role_emb_vals.to(combined_tokens.dtype)
 
             ref_conditioning_mask = torch.ones((bsz, ref_seq_len), device=accelerator.device, dtype=torch.bool)
 
@@ -2761,14 +2805,33 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(unwrapped_transformer)
-            with accelerator.autocast():
-                if hasattr(unwrapped_transformer, "forward_modalities"):
-                    pred_tokens, _ = unwrapped_transformer.forward_modalities(video_modality, None, perturbations)
-                else:
-                    base_model = (
-                        unwrapped_transformer.model if hasattr(unwrapped_transformer, "model") else unwrapped_transformer
-                    )
-                    pred_tokens, _ = base_model(video_modality, None, perturbations)
+            # Install patchify_proj forward hook for post_proj role embedding (no-op otherwise).
+            _role_hook_handle = None
+            if role_emb_post_proj_vals is not None:
+                _proj_module = getattr(unwrapped_transformer, "patchify_proj", None) or getattr(
+                    getattr(unwrapped_transformer, "model", None), "patchify_proj", None
+                )
+                if _proj_module is not None:
+                    _emb = role_emb_post_proj_vals
+                    def _role_emb_post_proj_hook(_mod, _inp, output, _emb=_emb):
+                        re = _emb.to(dtype=output.dtype, device=output.device)
+                        if output.shape[0] != re.shape[0]:
+                            repeat = output.shape[0] // re.shape[0]
+                            re = re.repeat(repeat, 1, 1)
+                        return output + re
+                    _role_hook_handle = _proj_module.register_forward_hook(_role_emb_post_proj_hook)
+            try:
+                with accelerator.autocast():
+                    if hasattr(unwrapped_transformer, "forward_modalities"):
+                        pred_tokens, _ = unwrapped_transformer.forward_modalities(video_modality, None, perturbations)
+                    else:
+                        base_model = (
+                            unwrapped_transformer.model if hasattr(unwrapped_transformer, "model") else unwrapped_transformer
+                        )
+                        pred_tokens, _ = base_model(video_modality, None, perturbations)
+            finally:
+                if _role_hook_handle is not None:
+                    _role_hook_handle.remove()
 
             target_pred_tokens = pred_tokens[:, ref_seq_len:, :]
             target_velocity = patchifier.patchify(noise - latents)
