@@ -16,6 +16,48 @@ logging.basicConfig(level=logging.INFO)
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 
+_MXFP8_MBITS_F32 = 23  # IEEE 754 float32 mantissa bits, used for E8M0 → f32 bit-trick
+
+
+def _mxfp8_ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _mxfp8_from_blocked(blocked_matrix: torch.Tensor, num_rows: int, num_cols: int) -> torch.Tensor:
+    """Inverse of comfy.float.to_blocked (cuBLAS scale-tile layout).
+
+    Input:  swizzled 2D tensor (P_M, P_KB) where
+              P_M  = ceil_div(num_rows, 128) * 128
+              P_KB = ceil_div(num_cols, 4) * 4
+    Output: unswizzled tensor of shape (num_rows, num_cols)
+    """
+    n_row_blocks = _mxfp8_ceil_div(num_rows, 128)
+    n_col_blocks = _mxfp8_ceil_div(num_cols, 4)
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+
+    step1 = blocked_matrix.reshape(-1, 32, 16)
+    step2 = step1.reshape(-1, 32, 4, 4).transpose(1, 2)
+    step3 = step2.reshape(n_row_blocks, n_col_blocks, 4, 32, 4)
+    step4 = step3.reshape(n_row_blocks, n_col_blocks, 128, 4)
+    step5 = step4.permute(0, 2, 1, 3)
+
+    unblocked = step5.reshape(padded_rows, padded_cols)
+    return unblocked[:num_rows, :num_cols].contiguous()
+
+
+def _mxfp8_e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
+    """Decode E8M0 (uint8 exponent only) to float32 via IEEE 754 bit-trick.
+
+    byte 0 → 0.0; otherwise 2.0 ** (byte - 127).
+    """
+    assert x.dtype == torch.uint8, "Input must be uint8"
+    biased_exp = x.to(torch.int32)
+    result = biased_exp << _MXFP8_MBITS_F32
+    result = torch.where(biased_exp == 0, torch.zeros_like(result), result)
+    return result.view(torch.float32)
+
+
 def calculate_fp8_maxval(exp_bits=4, mantissa_bits=3, sign_bits=1):
     """
     Calculate the maximum representable value in FP8 format.
@@ -307,15 +349,75 @@ def load_safetensors_with_fp8_optimization(
                     f"Will dequantize to bf16 before re-quantizing with FP8 scheme."
                 )
 
+            # Detect ComfyUI mxfp8 checkpoint (E8M0 swizzled block-32 scales).
+            # Identified by presence of .comfy_quant metadata blobs alongside fp8 weights + uint8 scales.
+            mxfp8_keys = set(k for k in keys if k.endswith(".comfy_quant"))
+            is_mxfp8 = bool(mxfp8_keys)
+            if is_mxfp8:
+                logger.info(
+                    f"Detected ComfyUI mxfp8 checkpoint with {len(mxfp8_keys)} comfy_quant tags. "
+                    f"Loading fp8 weights with un-swizzled E8M0 scales (block_size=32). "
+                    f"Re-quantization is skipped — weights are stored as-is in musubi per-block format."
+                )
+
             for key in tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", unit="key"):
-                # Skip scale keys from pre-quantized checkpoints — consumed via the .weight key
-                if key in checkpoint_scale_keys:
+                # Skip scale keys and comfy_quant tags from pre-quantized checkpoints — consumed via the .weight key
+                if key in checkpoint_scale_keys or key in mxfp8_keys:
                     continue
 
                 value = f.get_tensor(key)
 
                 # Save original device
                 original_device = value.device  # usually cpu
+
+                # mxfp8 path: fp8 weight + uint8 swizzled E8M0 scale. Two sub-cases:
+                #   (a) target Linear (will be patched) → keep fp8, store bf16 scale_weight [M, K/32, 1]
+                #   (b) non-target Linear (no forward patch) → dequant to bf16 and pass through
+                if is_mxfp8 and value.dtype.itemsize == 1 and key.endswith(".weight"):
+                    base = key[: -len(".weight")]
+                    cq_key = base + ".comfy_quant"
+                    sc_key = base + ".weight_scale"
+                    if cq_key in mxfp8_keys and sc_key in keys:
+                        if value.dim() != 2:
+                            raise ValueError(f"mxfp8 weight {key} expected 2D, got {value.shape}")
+                        if value.dtype != torch.float8_e4m3fn:
+                            raise ValueError(f"mxfp8 weight {key} expected float8_e4m3fn, got {value.dtype}")
+                        M, K = int(value.shape[0]), int(value.shape[1])
+                        if K % 32 != 0:
+                            raise ValueError(f"mxfp8 weight {key} K={K} not divisible by 32")
+                        K_blocks = K // 32
+                        scale_swizzled = original_f.get_tensor(sc_key)
+                        if scale_swizzled.dtype != torch.uint8:
+                            scale_swizzled = scale_swizzled.view(torch.uint8)
+
+                        # Move to calc device for fast unswizzle/decode
+                        if calc_device is not None:
+                            scale_swizzled = scale_swizzled.to(calc_device)
+                            value = value.to(calc_device)
+
+                        scale_uint8 = _mxfp8_from_blocked(scale_swizzled, num_rows=M, num_cols=K_blocks)
+                        scale_f32 = _mxfp8_e8m0_to_f32(scale_uint8)
+
+                        if is_target_key(key):
+                            # (a) target Linear: keep fp8, store [M, K_blocks, 1] bf16 scale to match musubi's per-block path
+                            scale_bf16 = scale_f32.to(torch.bfloat16).reshape(M, K_blocks, 1)
+                            target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                            state_dict[key] = value.to(target_device)
+                            state_dict[base + ".scale_weight"] = scale_bf16.to(target_device)
+                            optimized_count += 1
+                        else:
+                            # (b) non-target: dequant to bf16 fully, pass through normal flow
+                            w = value.to(torch.float32).reshape(M, K_blocks, 32)
+                            w = w * scale_f32.unsqueeze(-1)
+                            value = w.reshape(M, K).to(torch.bfloat16)
+                            target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                            state_dict[key] = value.to(target_device)
+                        continue
+                    else:
+                        raise ValueError(
+                            f"mxfp8 file: weight key {key} missing companion scale/comfy_quant. "
+                            f"Expected {sc_key} and {cq_key}."
+                        )
 
                 # Dequantize pre-quantized FP8 weights BEFORE weight_hook (LoRA merge),
                 # so the hook receives correct bf16 values instead of raw fp8
