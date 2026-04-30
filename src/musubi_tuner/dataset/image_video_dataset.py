@@ -689,7 +689,7 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
 class BucketSelector:
     RESOLUTION_STEPS_HUNYUAN = 16
     RESOLUTION_STEPS_WAN = 16
-    RESOLUTION_STEPS_LTX2 = 32
+    RESOLUTION_STEPS_LTX2 = 64  # patched: /64 alignment so reference_downscale=2 gives exact integer ratios
     RESOLUTION_STEPS_FRAMEPACK = 16
     RESOLUTION_STEPS_FLUX_KONTEXT = 16
     RESOLUTION_STEPS_FLUX_2 = 16
