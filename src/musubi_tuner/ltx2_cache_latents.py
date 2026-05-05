@@ -85,6 +85,15 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
         )
         datasets.extend(validation_dataset_group.datasets)
 
+    # Align bucket resolutions to (32 * reference_downscale) so downscaled
+    # reference dimensions stay VAE-aligned. Default downscale=1 → /32 alignment
+    # (LTX-2's natural value). With --reference_downscale=2, /64 alignment.
+    ref_downscale = max(1, getattr(args, "reference_downscale", 1))
+    if ref_downscale > 1:
+        bucket_reso_steps = 32 * ref_downscale
+        for d in datasets:
+            d.bucket_reso_steps_override = bucket_reso_steps
+
     return cast(Sequence[BaseDataset], datasets)
 
 

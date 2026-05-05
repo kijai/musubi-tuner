@@ -689,7 +689,9 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
 class BucketSelector:
     RESOLUTION_STEPS_HUNYUAN = 16
     RESOLUTION_STEPS_WAN = 16
-    RESOLUTION_STEPS_LTX2 = 64  # patched: /64 alignment so reference_downscale=2 gives exact integer ratios
+    RESOLUTION_STEPS_LTX2 = 32  # natural alignment for LTX-2's 32x spatial VAE compression
+    # NOTE: when --reference_downscale > 1, callers should pass reso_steps_override = 32 * downscale
+    # so the downscaled reference dimensions stay VAE-aligned. Plumbed via BaseDataset.bucket_reso_steps_override.
     RESOLUTION_STEPS_FRAMEPACK = 16
     RESOLUTION_STEPS_FLUX_KONTEXT = 16
     RESOLUTION_STEPS_FLUX_2 = 16
@@ -717,13 +719,22 @@ class BucketSelector:
     }
 
     def __init__(
-        self, resolution: Tuple[int, int], enable_bucket: bool = True, no_upscale: bool = False, architecture: str = "no_default"
+        self,
+        resolution: Tuple[int, int],
+        enable_bucket: bool = True,
+        no_upscale: bool = False,
+        architecture: str = "no_default",
+        reso_steps_override: Optional[int] = None,
     ):
         self.resolution = resolution
         self.bucket_area = resolution[0] * resolution[1]
         self.architecture = architecture
 
-        if architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
+        if reso_steps_override is not None:
+            # caller-supplied alignment (e.g. for LTX-2 with --reference_downscale > 1
+            # so downscaled refs stay VAE-aligned)
+            self.reso_steps = reso_steps_override
+        elif architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
             self.reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
         else:
             raise ValueError(f"Invalid architecture: {architecture}")
@@ -2290,6 +2301,11 @@ class BaseDataset(torch.utils.data.Dataset):
         self.separate_audio_buckets = separate_audio_buckets
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        # Optional override for BucketSelector reso_steps. Set externally (e.g. by the
+        # cache/train script) when caller knows the alignment must accommodate
+        # downscaling — e.g. LTX-2 with --reference_downscale > 1 needs
+        # 32 * reference_downscale alignment to keep ref dims VAE-aligned.
+        self.bucket_reso_steps_override: Optional[int] = None
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -2601,7 +2617,7 @@ class ImageDataset(BaseDataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture, reso_steps_override=self.bucket_reso_steps_override)
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
         batches: dict[tuple[int, int], list[ItemInfo]] = {}  # (width, height) -> [ItemInfo]
@@ -2745,7 +2761,7 @@ class ImageDataset(BaseDataset):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture, reso_steps_override=self.bucket_reso_steps_override)
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -3263,7 +3279,7 @@ class VideoDataset(BaseDataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
-        buckset_selector = BucketSelector(self.resolution, architecture=self.architecture)
+        buckset_selector = BucketSelector(self.resolution, architecture=self.architecture, reso_steps_override=self.bucket_reso_steps_override)
         self.datasource.set_bucket_selector(buckset_selector)
         self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
 
@@ -3431,7 +3447,7 @@ class VideoDataset(BaseDataset):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture, reso_steps_override=self.bucket_reso_steps_override)
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))

@@ -2341,6 +2341,18 @@ class NetworkTrainer:
                     shared_epoch=current_epoch,
                 )
 
+        # Align bucket resolutions to (32 * reference_downscale) for LTX-2 so downscaled
+        # ref dimensions stay VAE-aligned. Default downscale=1 → architecture's natural alignment.
+        from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL
+        ref_downscale = max(1, getattr(args, "reference_downscale", 1))
+        if ref_downscale > 1 and self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            bucket_reso_steps = 32 * ref_downscale
+            for dg in (train_dataset_group, validation_dataset_group):
+                if dg is None:
+                    continue
+                for d in dg.datasets:
+                    d.bucket_reso_steps_override = bucket_reso_steps
+
         if train_dataset_group.num_train_items == 0:
             raise ValueError(
                 "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
